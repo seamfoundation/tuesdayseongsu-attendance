@@ -10,9 +10,8 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
 ]
-creds = Credentials.from_service_account_file(
-    "tuesdayseongsu-attendace-a0436e87fbaf.json", scopes=SCOPES
-)
+service_account_info = st.secrets["google"]
+creds = Credentials.from_service_account_info(service_account_info, scopes=SCOPES)
 client = gspread.authorize(creds)
 
 # 스프레드시트 연결
