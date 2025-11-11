@@ -109,7 +109,7 @@ if "initialized" not in st.session_state:
     initialize_church_ids()
     st.session_state.initialized = True
 
-st.title("✝️ 화요성수 예배 출석 체크")
+st.title("✝️ 서울숲 화요성수 예배 출석 체크")
 
 name = st.text_input("이름을 입력하세요")
 
