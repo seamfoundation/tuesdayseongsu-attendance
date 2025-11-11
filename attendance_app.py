@@ -1,7 +1,9 @@
 import streamlit as st
 import gspread
+import time
 from google.oauth2.service_account import Credentials
 from datetime import datetime
+from gspread.exceptions import APIError
 
 # ────────────────────────────────
 # Google Sheets 인증
@@ -14,15 +16,14 @@ service_account_info = st.secrets["google"]
 creds = Credentials.from_service_account_info(service_account_info, scopes=SCOPES)
 client = gspread.authorize(creds)
 
-# 스프레드시트 연결
+# 시트 연결
 sheet = client.open_by_key("1S_heqlCi0j33RgcSWBvVAPKhApSh3yGWF6x7yOuCU1g")
 ws = sheet.sheet1
 church_ws = sheet.worksheet("church_list")
-log_ws = sheet.worksheet("attendance_log")  # ✅ 로그 시트 연결
-
+log_ws = sheet.worksheet("attendance_log")
 
 # ────────────────────────────────
-# 유틸 함수
+# 공통 유틸 함수
 # ────────────────────────────────
 def safe_int(value):
     try:
@@ -31,38 +32,53 @@ def safe_int(value):
         return 0
 
 
+def safe_write(func, *args, retries=3, delay=1, **kwargs):
+    """Google API 요청 안전 실행 (자동 재시도 + 쿨다운)"""
+    for attempt in range(retries):
+        try:
+            result = func(*args, **kwargs)
+            time.sleep(delay)  # ✅ 쿨다운 (요청 간격 최소 1초)
+            return result
+        except APIError as e:
+            if attempt < retries - 1:
+                st.warning(f"서버 혼잡으로 재시도 중... ({attempt+1}/{retries})")
+                time.sleep(delay * 2)
+            else:
+                st.error("⚠️ 구글시트 요청이 너무 많습니다. 잠시 후 다시 시도해주세요.")
+                raise e
+
+
+# ────────────────────────────────
+# 출석 로그 기록
+# ────────────────────────────────
 def log_attendance(name, church, church_id, is_new, count):
-    """출석 로그 자동 기록"""
     today = datetime.now().strftime("%Y-%m-%d")
     now_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_ws.append_row([today, name, church, "신규" if is_new else "기존", count, church_id, now_time])
+    safe_write(log_ws.append_row, [today, name, church, "신규" if is_new else "기존", count, church_id, now_time])
 
 
+# ────────────────────────────────
+# 교회 ID 초기화
+# ────────────────────────────────
 def initialize_church_ids():
-    """비어있는 교회 ID 자동 생성"""
     data = church_ws.get_all_values()
     if not data:
         return
-
     headers = data[0]
     if "교회 id" not in headers:
         st.error("church_list 시트에 '교회 id' 열이 필요합니다.")
         return
 
     id_col = headers.index("교회 id") + 1
-    updates = []
     for i, row in enumerate(data[1:], start=2):
         if len(row) < id_col or not row[id_col - 1].strip():
-            updates.append(("CH%03d" % (i - 1), i, id_col))
-
-    if updates:
-        for val, r, c in updates:
-            church_ws.update_cell(r, c, val)
-        st.success(f"✅ {len(updates)}개의 교회 ID가 자동 생성되었습니다.")
+            safe_write(church_ws.update_cell, i, id_col, f"CH{i-1:03d}")
 
 
+# ────────────────────────────────
+# 교회 등록 or ID 반환
+# ────────────────────────────────
 def ensure_church_exists(church_name, region="미입력"):
-    """교회명 존재 확인 후 없으면 등록, 있으면 ID 반환"""
     data = church_ws.get_all_records()
     today = datetime.now().strftime("%Y-%m-%d")
 
@@ -72,16 +88,18 @@ def ensure_church_exists(church_name, region="미입력"):
     for idx, row in enumerate(data, start=2):
         if row.get("교회명") == church_name:
             count = safe_int(row.get("누적 예배자")) + 1
-            church_ws.update(f"E{idx}", [[count]])
+            safe_write(church_ws.update, f"E{idx}", [[count]])
             return row.get("교회 id")
 
     new_id = f"CH{len(data) + 1:03d}"
-    church_ws.append_row([new_id, church_name, region, today, 1])
+    safe_write(church_ws.append_row, [new_id, church_name, region, today, 1])
     return new_id
 
 
+# ────────────────────────────────
+# 기존 예배자 출석
+# ────────────────────────────────
 def handle_attendance(row, row_idx):
-    """기존 예배자 출석 처리"""
     today = datetime.now().strftime("%Y-%m-%d")
     last_date = str(row.get("최근출석일", ""))
 
@@ -89,13 +107,11 @@ def handle_attendance(row, row_idx):
         st.info(f"{row['이름']} 님은 오늘 이미 출석하셨습니다 🙏")
     else:
         count = safe_int(row.get("출석횟수")) + 1
-        ws.batch_update([{
+        safe_write(ws.batch_update, [{
             'range': f"C{row_idx}:D{row_idx}",
             'values': [[count, today]]
         }])
         st.success(f"{row['이름']} 님, 오늘로 {count}번째 출석입니다 🙌")
-
-        # ✅ 로그 기록
         log_attendance(row["이름"], row["소속교회"], row.get("교회id", ""), False, count)
 
     st.session_state.show_registration = False
@@ -127,8 +143,7 @@ if st.button("확인"):
             st.warning(f"{name} 님의 정보가 없습니다. 아래에서 신규 등록을 진행해주세요 🙏")
             st.session_state.name = name
             st.session_state.show_registration = True
-
-        elif len(matches) >= 1:
+        else:
             st.session_state.name = name
             st.session_state.matches = matches
             st.session_state.show_select_church = True
@@ -162,7 +177,7 @@ if st.session_state.get("show_select_church", False):
 
 
 # ────────────────────────────────
-# [3] 신규 등록 폼 (가나다순 교회 선택 + 미소속 추가)
+# [3] 신규 등록 폼
 # ────────────────────────────────
 if st.session_state.get("show_registration", False):
     st.markdown("---")
@@ -190,11 +205,9 @@ if st.session_state.get("show_registration", False):
         if selected == "미소속":
             new_church_name = "미소속"
             new_region = "미입력"
-
         elif selected == "➕ 새 교회 등록":
             new_church_name = st.text_input("새 교회 이름을 입력하세요").replace(" ", "")
             new_region = st.text_input("교회 지역명 (예: 서울 성동구)")
-
         elif selected != "-- 교회 선택 --":
             new_church_name = selected.split(" (")[0]
             new_region = next(
@@ -212,17 +225,14 @@ if st.session_state.get("show_registration", False):
                 st.error("교회를 선택하거나 새로 등록해주세요.")
             else:
                 today = datetime.now().strftime("%Y-%m-%d")
-
                 church_id = ensure_church_exists(new_church_name, new_region)
-                ws.append_row([
+                safe_write(ws.append_row, [
                     st.session_state.name, new_church_name, 1, today, today,
                     phone, email, church_id
                 ])
-
-                # ✅ 로그 시트에도 기록
                 log_attendance(st.session_state.name, new_church_name, church_id, True, 1)
-
                 st.success(f"{st.session_state.name} 님, 첫 출석이 완료되었습니다 🌿 환영합니다!")
                 st.session_state.show_registration = False
     else:
         st.warning("개인정보 이용 동의가 필요합니다.")
+
